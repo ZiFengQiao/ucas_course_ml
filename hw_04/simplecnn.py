@@ -70,11 +70,30 @@ class SimpleCNN:
         }
 
     @staticmethod
-    def conv2d(input, filters, bias, stride=1, padding=0):
+    def _im2col(input_pad, k_h, k_w, stride):
+        # 卷积窗口展开，输入为 H x W x C x N，输出为 (H_out*W_out*N, kH*kW*C)
+        # 利用GEMM加速卷积计算
+
+        H, W, C, N = input_pad.shape
+        H_out = (H - k_h) // stride + 1
+        W_out = (W - k_w) // stride + 1
+
+        shape = (H_out, W_out, k_h, k_w, C, N)
+        strides = (stride * input_pad.strides[0], stride * input_pad.strides[1],
+                   input_pad.strides[0], input_pad.strides[1],
+                   input_pad.strides[2], input_pad.strides[3])
+
+        patches = np.lib.stride_tricks.as_strided(input_pad, shape=shape, strides=strides)
+        # (H_out, W_out, kH, kW, C, N) → (H_out, W_out, N, kH, kW, C) → 2D
+        patches = patches.transpose(0, 1, 5, 2, 3, 4)
+        return np.ascontiguousarray(patches.reshape(H_out * W_out * N, k_h * k_w * C))
+
+    # for循环展开，硬算
+    @staticmethod
+    def conv2d_base(input, filters, bias, stride=1, padding=0):
         # input   : H x W x C_in x N; N是批次大小
         # filters : F_h x F_w x C_in x c_out; c_out 是每一个卷积核产生的输出通道数
         # bias    : c_out
-        assert input.shape[2] == filters.shape[2], "Input channels must match filter channels"
 
         if padding > 0:
             input = np.pad(input, ((padding, padding), (padding, padding), (0, 0)), mode='constant')
@@ -106,10 +125,12 @@ class SimpleCNN:
             res[:, :, k, :] += bias[k]
         return res
 
+    # for循环展开，硬算
     @staticmethod
-    def avg_pool2d(input, kernel_size=2):
+    def avg_pool2d_base(input, kernel_size=2):
         # input : H x W x C x N; N是批次大小
         # 默认丢弃边界不完整部分
+        # for循环展开，硬算
         ch_in = input.shape[2]
         ch_width = (input.shape[0] - kernel_size) // kernel_size + 1
         ch_height = (input.shape[1] - kernel_size) // kernel_size + 1
@@ -128,48 +149,9 @@ class SimpleCNN:
                         )
         return res
 
+    # for循环展开，硬算
     @staticmethod
-    def max_pool2d(input, kernel_size=2):
-        # input : H x W x C x N; N是批次大小
-        # 默认丢弃边界不完整部分
-        ch_in = input.shape[2]
-        ch_width = (input.shape[0] - kernel_size) // kernel_size + 1
-        ch_height = (input.shape[1] - kernel_size) // kernel_size + 1
-        N = input.shape[3]
-
-        res = np.zeros((ch_width, ch_height, ch_in, N))
-
-        in_h, in_w = input.shape[0], input.shape[1]
-        for n in range(N):
-            for c in range(ch_in):
-                _region = input[:, :, c, n]
-                for i in range(0, in_h - kernel_size + 1, kernel_size):
-                    for j in range(0, in_w - kernel_size + 1, kernel_size):
-                        res[i // kernel_size, j // kernel_size, c, n] = np.max(
-                            _region[i:i + kernel_size, j:j + kernel_size]
-                        )
-        return res
-
-    @staticmethod
-    def avg_pool2d_backward(dout, input_shape, kernel_size=2):
-        # dout : H_out x W_out x C x N
-        # input_shape : H x W x C x N
-        h_in, w_in, ch_in, n_in = input_shape
-        dx = np.zeros(input_shape)
-        out_h, out_w = dout.shape[0], dout.shape[1]
-        scale = 1.0 / (kernel_size * kernel_size)
-
-        for n in range(n_in):
-            for c in range(ch_in):
-                for i in range(out_h):
-                    for j in range(out_w):
-                        h_start = i * kernel_size
-                        w_start = j * kernel_size
-                        dx[h_start:h_start + kernel_size, w_start:w_start + kernel_size, c, n] += dout[i, j, c, n] * scale
-        return dx
-
-    @staticmethod
-    def conv2d_backward(input, filters, d_out, stride=1, padding=0):
+    def conv2d_backward_base(input, filters, d_out, stride=1, padding=0):
         # input   : H x W x C_in x N
         # filters : F_h x F_w x C_in x C_out
         # d_out   : H_out x W_out x C_out x N
@@ -195,7 +177,94 @@ class SimpleCNN:
                         w_start = j * stride
                         patch = input_pad[h_start:h_start + f_h, w_start:w_start + f_w, :, n]
                         d_filters[:, :, :, k] += patch * d_out[i, j, k, n]
-                        d_input_pad[h_start:h_start + f_h, w_start:w_start + f_w, :, n] += filters[:, :, :, k] * d_out[i, j, k, n]
+                        d_input_pad[h_start:h_start + f_h, w_start:w_start + f_w, :, n] += filters[:, :, :, k] * d_out[
+                            i, j, k, n]
+
+        if padding > 0:
+            d_input = d_input_pad[padding:-padding, padding:-padding, :, :]
+        else:
+            d_input = d_input_pad
+
+        return d_input, d_filters, d_bias
+
+    # 使用im2col进行GEMM加速卷积计算
+    @staticmethod
+    def conv2d(input, filters, bias, stride=1, padding=0):
+        # input   : H x W x C_in x N
+        # filters : kH x kW x C_in x C_out
+        # bias    : C_out
+
+        if padding > 0:
+            input = np.pad(input, ((padding, padding), (padding, padding), (0, 0), (0, 0)), mode='constant')
+
+        k_h, k_w, C_in, C_out = filters.shape
+        H, W, _, N = input.shape
+        H_out = (H - k_h) // stride + 1
+        W_out = (W - k_w) // stride + 1
+
+        cols = SimpleCNN._im2col(input, k_h, k_w, stride)               # (H_out*W_out*N, kH*kW*C_in)
+        W_col = filters.reshape(k_h * k_w * C_in, C_out)                # (kH*kW*C_in, C_out)
+        out = cols @ W_col + bias                                        # (H_out*W_out*N, C_out)
+
+        # reshape back to (H_out, W_out, C_out, N)
+        out = out.reshape(H_out, W_out, N, C_out).transpose(0, 1, 3, 2)
+        return out
+
+    # 使用im2col加速池化计算
+    @staticmethod
+    def avg_pool2d(input, kernel_size=2):
+        # input : H x W x C x N
+        H, W, C, N = input.shape
+        H_out = (H - kernel_size) // kernel_size + 1
+        W_out = (W - kernel_size) // kernel_size + 1
+
+        shape = (H_out, W_out, kernel_size, kernel_size, C, N)
+        strides = (kernel_size * input.strides[0], kernel_size * input.strides[1],
+                   input.strides[0], input.strides[1],
+                   input.strides[2], input.strides[3])
+
+        patches = np.lib.stride_tricks.as_strided(input, shape=shape, strides=strides)
+        return np.mean(patches, axis=(2, 3))
+
+    @staticmethod
+    def conv2d_backward(input, filters, d_out, stride=1, padding=0):
+        # input   : H x W x C_in x N
+        # filters : kH x kW x C_in x C_out
+        # d_out   : H_out x W_out x C_out x N
+        H, W, C_in, N = input.shape
+        k_h, k_w, _, C_out = filters.shape
+        H_out, W_out = d_out.shape[0], d_out.shape[1]
+
+        if padding > 0:
+            input_pad = np.pad(input, ((padding, padding), (padding, padding), (0, 0), (0, 0)), mode='constant')
+        else:
+            input_pad = input
+
+        # d_out → (H_out*W_out*N, C_out)
+        d_out_2d = np.ascontiguousarray(d_out.transpose(0, 1, 3, 2).reshape(H_out * W_out * N, C_out))
+
+        # d_bias
+        d_bias = np.sum(d_out_2d, axis=0)
+
+        # im2col of input_pad
+        cols = SimpleCNN._im2col(input_pad, k_h, k_w, stride)           # (H_out*W_out*N, kH*kW*C_in)
+
+        # d_filters = cols.T @ d_out_2d  →  (kH*kW*C_in, C_out)
+        d_filters = (cols.T @ d_out_2d).reshape(k_h, k_w, C_in, C_out)
+
+        # d_input:  d_out_2d @ W_col.T  →  col2im
+        W_col = filters.reshape(k_h * k_w * C_in, C_out)
+        d_input_col = d_out_2d @ W_col.T                                # (H_out*W_out*N, kH*kW*C_in)
+        d_input_col = d_input_col.reshape(H_out, W_out, N, k_h, k_w, C_in)
+
+        H_pad, W_pad = input_pad.shape[0], input_pad.shape[1]
+        d_input_pad = np.zeros((H_pad, W_pad, C_in, N), dtype=d_out.dtype)
+
+        for i in range(k_h):
+            for j in range(k_w):
+                d_input_pad[i:i + H_out * stride:stride,
+                            j:j + W_out * stride:stride, :, :] += \
+                    d_input_col[:, :, :, i, j, :].transpose(0, 1, 3, 2)
 
         if padding > 0:
             d_input = d_input_pad[padding:-padding, padding:-padding, :, :]
@@ -205,11 +274,24 @@ class SimpleCNN:
         return d_input, d_filters, d_bias
 
     @staticmethod
+    def avg_pool2d_backward(dout, input_shape, kernel_size=2):
+        # dout : H_out x W_out x C x N
+        H_out, W_out = dout.shape[0], dout.shape[1]
+        scale = 1.0 / (kernel_size * kernel_size)
+
+        dx = np.zeros(input_shape, dtype=dout.dtype)
+        for i in range(kernel_size):
+            for j in range(kernel_size):
+                dx[i::kernel_size, j::kernel_size, :, :] += dout * scale
+        return dx
+
+    @staticmethod
     def relu(x):
         return np.maximum(0, x)
 
     @staticmethod
     def relu_derivative(x):
+        # relu反向传播过程中是门控的作用，只有当输入大于0时，梯度才会传递，否则为0
         return (x > 0).astype(float)
 
     @staticmethod
@@ -317,11 +399,6 @@ class SimpleCNN:
         self.conv1['weights'].grad = d_w1
         self.conv1['bias'].grad = d_b1
 
-        print(
-            np.linalg.norm(self.fc['weights'].grad),
-            np.linalg.norm(self.conv2['weights'].grad),
-            np.linalg.norm(self.conv1['weights'].grad)
-        )
         return loss
 
     # 更新权重函数 请编写其中的内容
@@ -336,9 +413,9 @@ class SimpleCNN:
 # 加载MNIST数据集
 train_x, train_y, test_x, test_y = load_mnist()
 
-# 裁剪数据集
-train_x, train_y = train_x[:600], train_y[:600]
-test_x, test_y = test_x[:100], test_y[:100]
+# # 裁剪数据集
+# train_x, train_y = train_x[:600], train_y[:600]
+# test_x, test_y = test_x[:100], test_y[:100]
 
 train_n = len(train_x)
 test_n = len(test_x)
@@ -354,9 +431,15 @@ cnn = SimpleCNN()
 total_train = len(train_x)
 # 超参数设置
 learning_rate = 0.01
-num_epochs = 2
-batch_size = 16
+num_epochs = 10
+batch_size = 32
 num_batchs = total_train // batch_size
+
+loss_array = []
+acc_array = []
+
+# batch为单位的日志输出间隔
+log_interval = 100
 
 # 训练模型
 for epoch in range(num_epochs):
@@ -371,15 +454,44 @@ for epoch in range(num_epochs):
         # 反向传播
         loss = cnn.backward(batch_y)
 
+        # 计算当前批次的准确率
+        accuracy = np.mean(np.argmax(output, axis=1) == batch_y)
+
         # 更新权重
         cnn.update(learning_rate)
 
-        print(f'\r Epoch {epoch + 1}/{num_epochs}, Batch {i // batch_size + 1} / {num_batchs}, Loss: {loss:.4f}')
-        print(f'Batch output result: {np.argmax(output, axis=1)}')
+        if i % log_interval == 0:
+            loss_array.append(loss)
+
+            print(f'Epoch {epoch + 1}/{num_epochs}, Batch {i // batch_size + 1} / {num_batchs}, Loss: {loss:.4f}',)
+
+    # 测试模型
+    predictions = np.argmax(cnn.forward(test_x), axis=1)
+    accuracy = np.mean(predictions == test_y)
+    print(f'Epoch {epoch + 1}, validation test accuracy: {accuracy * 100}%')
+    acc_array.append(accuracy)
+
+# 绘制损失和准确率曲线
+import matplotlib.pyplot as plt
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+plt.plot(loss_array, label='Loss')
+plt.title('Training Loss')
+plt.xlabel(f'{log_interval} Batch')
+plt.ylabel('Loss')
+plt.legend()
+plt.subplot(1, 2, 2)
+plt.plot(acc_array, label='Accuracy')
+plt.title('Training Accuracy')
+plt.xlabel('epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+plt.tight_layout()
+plt.show()
 
 # 测试模型
-predictions = [np.argmax(cnn.forward(x), axis=1) for x in test_x]
-accuracy = np.mean(np.array(predictions) == test_y)
+predictions = np.argmax(cnn.forward(test_x), axis=1)
+accuracy = np.mean(predictions == test_y)
 print(f'Test accuracy: {accuracy * 100}%')
 
 
